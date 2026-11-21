@@ -7,23 +7,35 @@ package software.amazon.smithy.rulesengine.logic.cfg;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import software.amazon.smithy.rulesengine.language.Endpoint;
 import software.amazon.smithy.rulesengine.language.EndpointRuleSet;
+import software.amazon.smithy.rulesengine.language.evaluation.type.BooleanType;
 import software.amazon.smithy.rulesengine.language.evaluation.type.OptionalType;
 import software.amazon.smithy.rulesengine.language.evaluation.type.RecordType;
 import software.amazon.smithy.rulesengine.language.evaluation.type.Type;
 import software.amazon.smithy.rulesengine.language.syntax.Identifier;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.Expression;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.Reference;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.BooleanEquals;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.Coalesce;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.IsSet;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.LibraryFunction;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.StringEquals;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.Substring;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.literal.Literal;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.literal.RecordLiteral;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.literal.StringLiteral;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.literal.TupleLiteral;
 import software.amazon.smithy.rulesengine.language.syntax.rule.Condition;
+import software.amazon.smithy.rulesengine.language.syntax.rule.EndpointRule;
+import software.amazon.smithy.rulesengine.language.syntax.rule.ErrorRule;
 import software.amazon.smithy.rulesengine.language.syntax.rule.Rule;
 import software.amazon.smithy.rulesengine.language.syntax.rule.TreeRule;
 
@@ -35,6 +47,8 @@ final class CoalesceTransform {
     private static final Logger LOGGER = Logger.getLogger(CoalesceTransform.class.getName());
 
     private final Map<CoalesceKey, Condition> coalesceCache = new HashMap<>();
+    // Reference counts for each rule, including its result and descendants. Computed once.
+    private final Map<Rule, Map<String, Integer>> referenceCountsByRule = new IdentityHashMap<>();
     private int coalesceCount = 0;
     private int cacheHits = 0;
     private int skippedNoZeroValue = 0;
@@ -42,6 +56,10 @@ final class CoalesceTransform {
 
     static EndpointRuleSet transform(EndpointRuleSet ruleSet) {
         CoalesceTransform transform = new CoalesceTransform();
+
+        for (Rule rule : ruleSet.getRules()) {
+            transform.countSubtreeReferences(rule);
+        }
 
         List<Rule> transformedRules = new ArrayList<>();
         for (Rule rule : ruleSet.getRules()) {
@@ -66,13 +84,9 @@ final class CoalesceTransform {
     }
 
     private Rule transformRule(Rule rule) {
-        // Count local usage for THIS rule's conditions
-        Map<String, Integer> localVarUsage = new HashMap<>();
-        for (Condition condition : rule.getConditions()) {
-            for (String ref : condition.getFunction().getReferences()) {
-                localVarUsage.merge(ref, 1, Integer::sum);
-            }
-        }
+        // A binding used outside the next condition is not safe to inline. Counts cover this rule's
+        // conditions, its result, and nested rules, and were collected in one bottom-up pass.
+        Map<String, Integer> localVarUsage = referenceCountsByRule.get(rule);
 
         Set<Condition> eliminatedConditions = new HashSet<>();
         List<Condition> transformedConditions = transformConditions(
@@ -128,6 +142,52 @@ final class CoalesceTransform {
         return result;
     }
 
+    // Counts references in this rule and every descendant once. Child totals are merged upward.
+    private void countSubtreeReferences(Rule rule) {
+        Map<String, Integer> usage = new HashMap<>();
+        for (Condition condition : rule.getConditions()) {
+            countReferences(condition.getFunction(), usage);
+        }
+        if (rule instanceof TreeRule) {
+            for (Rule nested : ((TreeRule) rule).getRules()) {
+                countSubtreeReferences(nested);
+                mergeCounts(usage, referenceCountsByRule.get(nested));
+            }
+        } else {
+            countOwnResult(rule, usage);
+        }
+        referenceCountsByRule.put(rule, usage);
+    }
+
+    private static void mergeCounts(Map<String, Integer> into, Map<String, Integer> from) {
+        for (Map.Entry<String, Integer> entry : from.entrySet()) {
+            into.merge(entry.getKey(), entry.getValue(), Integer::sum);
+        }
+    }
+
+    private static void countOwnResult(Rule rule, Map<String, Integer> usage) {
+        if (rule instanceof EndpointRule) {
+            Endpoint endpoint = ((EndpointRule) rule).getEndpoint();
+            countReferences(endpoint.getUrl(), usage);
+            for (List<Expression> values : endpoint.getHeaders().values()) {
+                for (Expression value : values) {
+                    countReferences(value, usage);
+                }
+            }
+            for (Literal value : endpoint.getProperties().values()) {
+                countReferences(value, usage);
+            }
+        } else if (rule instanceof ErrorRule) {
+            countReferences(((ErrorRule) rule).getError(), usage);
+        }
+    }
+
+    private static void countReferences(Expression expression, Map<String, Integer> usage) {
+        for (String ref : expression.getReferences()) {
+            usage.merge(ref, 1, Integer::sum);
+        }
+    }
+
     private boolean canCoalesce(String var, Condition bind, Condition use, Map<String, Integer> localVarUsage) {
         if (!use.getFunction().getReferences().contains(var)) {
             return false;
@@ -156,7 +216,74 @@ final class CoalesceTransform {
             return false;
         }
 
+        // Splicing coalesce(expr, zero) into a template writes the call into template text.
+        if (referencesTemplate(use.getFunction(), var)) {
+            return false;
+        }
+
+        // A fallible bind ends the rule on None or false. Replacing it with the zero value is sound
+        // only when the consuming condition is itself a failure for that zero.
+        Literal zero = innerType.getZeroValue().get();
+        if ((type instanceof OptionalType || innerType instanceof BooleanType)
+                && !failsForZero(use.getFunction(), var, zero)) {
+            return false;
+        }
+
         return true;
+    }
+
+    private static boolean failsForZero(LibraryFunction use, String var, Literal zero) {
+        List<Expression> args = use.getArguments();
+        if ((use instanceof StringEquals || use instanceof BooleanEquals) && args.size() >= 2) {
+            for (int i = 0; i < 2; i++) {
+                Expression other = args.get(1 - i);
+                if (isReference(args.get(i), var) && isStaticLiteral(other) && !other.equals(zero)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // substring returns empty when the input is too short to include the requested span.
+        // An empty string cannot yield a span.
+        return use instanceof Substring && !args.isEmpty() && isReference(args.get(0), var);
+    }
+
+    private static boolean isStaticLiteral(Expression expression) {
+        if (!(expression instanceof Literal)) {
+            return false;
+        } else if (expression instanceof StringLiteral) {
+            return ((StringLiteral) expression).value().isStatic();
+        }
+        return true;
+    }
+
+    private static boolean referencesTemplate(Expression expression, String var) {
+        if (expression instanceof StringLiteral) {
+            return expression.getReferences().contains(var);
+        } else if (expression instanceof TupleLiteral) {
+            for (Literal member : ((TupleLiteral) expression).members()) {
+                if (referencesTemplate(member, var)) {
+                    return true;
+                }
+            }
+        } else if (expression instanceof RecordLiteral) {
+            for (Literal member : ((RecordLiteral) expression).members().values()) {
+                if (referencesTemplate(member, var)) {
+                    return true;
+                }
+            }
+        } else if (expression instanceof LibraryFunction) {
+            for (Expression argument : ((LibraryFunction) expression).getArguments()) {
+                if (referencesTemplate(argument, var)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isReference(Expression expression, String var) {
+        return expression instanceof Reference && ((Reference) expression).getName().toString().equals(var);
     }
 
     private Condition createCoalescedCondition(Condition bind, Condition use, String var) {

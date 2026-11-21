@@ -4,7 +4,9 @@
  */
 package software.amazon.smithy.rulesengine.logic.cfg;
 
+import java.util.ArrayDeque;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -37,7 +39,9 @@ import software.amazon.smithy.rulesengine.language.syntax.rule.TreeRule;
  *     branch2: parsed = parseURL(Endpoint) // renamed to 'url'
  * </pre>
  *
- * <p>The transform avoids renaming when it would cause variable shadowing.
+ * <p>The transform avoids renaming when it would cause variable shadowing. Each rename is recorded on
+ * the rule that owns it and applied through a scope stack, so sibling rules that legally reuse one
+ * local name keep independent rewrites.
  *
  * @see SyntheticBindingTransform
  * @see DeadStoreEliminationTransform
@@ -48,8 +52,11 @@ final class VariableConsolidationTransform extends TreeMapper {
     // Global map of canonical expressions to their first variable name seen
     private final Map<String, String> globalExpressionToVar = new HashMap<>();
 
-    // Maps old variable names to new canonical names for rewriting references
-    private final Map<String, String> variableRenameMap = new HashMap<>();
+    // Renames owned by each rule. Sibling rules that reuse a local name do not share one map entry.
+    private final Map<Rule, Map<String, String>> renamesByRule = new IdentityHashMap<>();
+
+    // Active rename scope while rewriting a rule and its descendants.
+    private final Deque<Map<String, String>> scopeStack = new ArrayDeque<>();
 
     // Tracks conditions to eliminate (using identity for exact instance matching)
     private final Set<Condition> conditionsToEliminate = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -116,7 +123,7 @@ final class VariableConsolidationTransform extends TreeMapper {
             // Check if already bound in parent scope
             String parentVar = parentBindings.get(canonical);
             if (parentVar != null) {
-                variableRenameMap.put(varName, parentVar);
+                recordRename(rule, varName, parentVar);
                 conditionsToEliminate.add(condition);
                 eliminatedCount++;
                 LOGGER.fine(() -> String.format("Eliminating redundant binding: '%s' -> '%s' for: %s",
@@ -124,16 +131,15 @@ final class VariableConsolidationTransform extends TreeMapper {
                         parentVar,
                         canonical));
             } else {
-                currentBindings.put(canonical, varName);
-                visibleAncestorVars.add(varName);
-
                 // Check for global consolidation opportunity
                 String globalVar = globalExpressionToVar.get(canonical);
+                String boundName = varName;
                 if (globalVar != null && !globalVar.equals(varName)) {
-                    boolean wouldShadow = wouldCauseShadowing(globalVar, rule, ancestorVars);
+                    // Names already accepted in this rule are in scope, same as enclosing rules.
+                    boolean wouldShadow = wouldCauseShadowing(globalVar, varName, rule, visibleAncestorVars);
                     if (!wouldShadow) {
-                        // No shadowing - safe to rename the binding
-                        variableRenameMap.put(varName, globalVar);
+                        recordRename(rule, varName, globalVar);
+                        boundName = globalVar;
                         consolidatedCount++;
                         LOGGER.fine(() -> String.format("Consolidating '%s' -> '%s' for: %s",
                                 varName,
@@ -149,6 +155,8 @@ final class VariableConsolidationTransform extends TreeMapper {
                 } else if (globalVar == null) {
                     globalExpressionToVar.put(canonical, varName);
                 }
+                currentBindings.put(canonical, boundName);
+                visibleAncestorVars.add(boundName);
             }
         }
 
@@ -159,13 +167,30 @@ final class VariableConsolidationTransform extends TreeMapper {
         }
     }
 
-    private boolean wouldCauseShadowing(String varName, Rule currentRule, Set<String> ancestorVars) {
-        if (ancestorVars.contains(varName)) {
+    private boolean wouldCauseShadowing(
+            String targetName,
+            String currentVar,
+            Rule currentRule,
+            Set<String> visibleAncestorVars
+    ) {
+        if (visibleAncestorVars.contains(targetName)) {
+            return true;
+        }
+
+        // A later condition in this rule may already assign the target name.
+        Set<String> definedHere = ruleDefinedVars.get(currentRule);
+        if (definedHere != null && !targetName.equals(currentVar) && definedHere.contains(targetName)) {
             return true;
         }
 
         // Check if any descendant rule defines this variable
-        return wouldShadowInDescendants(varName, currentRule);
+        return wouldShadowInDescendants(targetName, currentRule);
+    }
+
+    private void recordRename(Rule rule, String from, String to) {
+        if (!from.equals(to)) {
+            renamesByRule.computeIfAbsent(rule, ignored -> new HashMap<>()).put(from, to);
+        }
     }
 
     private boolean wouldShadowInDescendants(String varName, Rule rule) {
@@ -184,6 +209,22 @@ final class VariableConsolidationTransform extends TreeMapper {
     }
 
     @Override
+    public Rule rule(Rule r) {
+        Map<String, String> parent = scopeStack.isEmpty() ? Collections.emptyMap() : scopeStack.peek();
+        Map<String, String> scope = new HashMap<>(parent);
+        Map<String, String> own = renamesByRule.get(r);
+        if (own != null) {
+            scope.putAll(own);
+        }
+        scopeStack.push(scope);
+        try {
+            return super.rule(r);
+        } finally {
+            scopeStack.pop();
+        }
+    }
+
+    @Override
     public Condition condition(Rule rule, Condition condition) {
         // Eliminate redundant conditions
         if (conditionsToEliminate.contains(condition)) {
@@ -193,16 +234,18 @@ final class VariableConsolidationTransform extends TreeMapper {
         LibraryFunction fn = condition.getFunction();
         LibraryFunction rewrittenFn = libraryFunction(fn);
 
-        // Check if binding needs renaming
+        // Check if this rule's own binding needs renaming. Inherited renames rewrite references only.
         if (condition.getResult().isPresent()) {
             String varName = condition.getResult().get().toString();
-            String canonicalName = variableRenameMap.get(varName);
-
-            if (canonicalName != null) {
-                return Condition.builder()
-                        .fn(rewrittenFn)
-                        .result(Identifier.of(canonicalName))
-                        .build();
+            Map<String, String> own = renamesByRule.get(rule);
+            if (own != null && own.containsKey(varName)) {
+                String canonicalName = resolve(varName);
+                if (canonicalName != null) {
+                    return Condition.builder()
+                            .fn(rewrittenFn)
+                            .result(Identifier.of(canonicalName))
+                            .build();
+                }
             }
         }
 
@@ -218,7 +261,7 @@ final class VariableConsolidationTransform extends TreeMapper {
     public Expression expression(Expression expression) {
         // Short-circuit if no references need rewriting
         for (String ref : expression.getReferences()) {
-            if (variableRenameMap.containsKey(ref)) {
+            if (resolve(ref) != null) {
                 return super.expression(expression);
             }
         }
@@ -227,10 +270,23 @@ final class VariableConsolidationTransform extends TreeMapper {
 
     @Override
     public Reference reference(Reference ref) {
-        String canonicalName = variableRenameMap.get(ref.getName().toString());
+        String canonicalName = resolve(ref.getName().toString());
         if (canonicalName != null) {
             return Expression.getReference(Identifier.of(canonicalName));
         }
         return ref;
+    }
+
+    // The recorded target is the final name. Do not follow it: a parent rename of `x` to `a` and a
+    // child rename of `b` to `x` are different variables, so `b` must stay `x`.
+    private String resolve(String name) {
+        if (scopeStack.isEmpty()) {
+            return null;
+        }
+        String renamed = scopeStack.peek().get(name);
+        if (renamed == null || renamed.equals(name)) {
+            return null;
+        }
+        return renamed;
     }
 }

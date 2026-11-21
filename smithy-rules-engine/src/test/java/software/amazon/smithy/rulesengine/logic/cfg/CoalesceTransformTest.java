@@ -5,11 +5,15 @@
 package software.amazon.smithy.rulesengine.logic.cfg;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import software.amazon.smithy.rulesengine.language.Endpoint;
 import software.amazon.smithy.rulesengine.language.EndpointRuleSet;
+import software.amazon.smithy.rulesengine.language.evaluation.RuleEvaluator;
+import software.amazon.smithy.rulesengine.language.evaluation.value.Value;
 import software.amazon.smithy.rulesengine.language.syntax.Identifier;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.Expression;
 import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.BooleanEquals;
@@ -26,6 +30,7 @@ import software.amazon.smithy.rulesengine.language.syntax.rule.Rule;
 import software.amazon.smithy.rulesengine.language.syntax.rule.TreeRule;
 import software.amazon.smithy.rulesengine.logic.TestHelpers;
 import software.amazon.smithy.utils.ListUtils;
+import software.amazon.smithy.utils.MapUtils;
 
 class CoalesceTransformTest {
 
@@ -571,5 +576,113 @@ class CoalesceTransformTest {
         // Should NOT coalesce because 'url' is used in the inner rule
         TreeRule transformedTree = (TreeRule) transformed.getRules().get(0);
         assertEquals(3, transformedTree.getConditions().size()); // isSet + bind + use (not coalesced)
+    }
+
+    @Test
+    void keepsSubstringBindingUsedByErrorEndpointAndNestedRule() {
+        Condition bind = substringAssign("c");
+        Condition use = stringEqualsVar("c", "x0");
+
+        Rule errorRule = ErrorRule.builder()
+                .conditions(bind, use)
+                .error(Literal.of("found {c}"));
+        Rule endpointRule = EndpointRule.builder()
+                .conditions(bind, use)
+                .endpoint(TestHelpers.endpoint("https://{c}.example.com"));
+        Rule treeRule = TreeRule.builder()
+                .conditions(bind, use)
+                .treeRule(ErrorRule.builder().error(Literal.of("found {c}")));
+
+        EndpointRuleSet transformed = CoalesceTransform.transform(ruleset(errorRule, endpointRule, treeRule));
+
+        assertAssignKept(transformed.getRules().get(0), "c");
+        assertAssignKept(transformed.getRules().get(1), "c");
+        assertAssignKept(transformed.getRules().get(2), "c");
+        transformed.typeCheck();
+    }
+
+    @Test
+    void keepsBindingUsedByHeaderPropertyOrNestedCondition() {
+        Condition bind = substringAssign("c");
+        Condition use = stringEqualsVar("c", "x0");
+
+        Rule headerRule = EndpointRule.builder()
+                .conditions(bind, use)
+                .endpoint(Endpoint.builder()
+                        .url(Expression.of("https://example.com"))
+                        .putHeader("x-id", Literal.of("{c}"))
+                        .build());
+        Rule propertyRule = EndpointRule.builder()
+                .conditions(bind, use)
+                .endpoint(Endpoint.builder()
+                        .url(Expression.of("https://example.com"))
+                        .putProperty(Identifier.of("bucket"), Literal.of("{c}"))
+                        .build());
+        Rule treeRule = TreeRule.builder()
+                .conditions(bind, use)
+                .treeRule(EndpointRule.builder()
+                        .conditions(stringEqualsVar("c", "zz"))
+                        .endpoint(TestHelpers.endpoint("https://example.com")));
+
+        EndpointRuleSet transformed = CoalesceTransform.transform(ruleset(headerRule, propertyRule, treeRule));
+
+        assertAssignKept(transformed.getRules().get(0), "c");
+        assertAssignKept(transformed.getRules().get(1), "c");
+        assertAssignKept(transformed.getRules().get(2), "c");
+        transformed.typeCheck();
+    }
+
+    @Test
+    void doesNotCoalesceSubstringIntoNot() {
+        Rule rule = EndpointRule.builder()
+                .conditions(substringAssign("c"),
+                        Condition.builder()
+                                .fn(Not.ofExpressions(StringEquals.ofExpressions(
+                                        Expression.getReference(Identifier.of("c")),
+                                        Literal.of("x"))))
+                                .build())
+                .endpoint(TestHelpers.endpoint("https://example.com"));
+
+        EndpointRuleSet transformed = CoalesceTransform.transform(ruleset(rule));
+
+        // not(stringEquals(c, "x")) succeeds when c is replaced with "". A short R must still fail.
+        assertAssignKept(transformed.getRules().get(0), "c");
+        transformed.typeCheck();
+        assertThrows(RuntimeException.class,
+                () -> RuleEvaluator.evaluate(transformed, MapUtils.of(Identifier.of("R"), Value.stringValue(""))));
+        assertEquals("https://example.com",
+                RuleEvaluator.evaluate(transformed, MapUtils.of(Identifier.of("R"), Value.stringValue("y")))
+                        .expectEndpointValue()
+                        .getUrl());
+    }
+
+    private static Condition substringAssign(String name) {
+        return Condition.builder()
+                .fn(TestHelpers.substring("R", 0, 1, false))
+                .result(Identifier.of(name))
+                .build();
+    }
+
+    private static Condition stringEqualsVar(String name, String value) {
+        return Condition.builder()
+                .fn(StringEquals.ofExpressions(Expression.getReference(Identifier.of(name)), Literal.of(value)))
+                .build();
+    }
+
+    private static EndpointRuleSet ruleset(Rule... rules) {
+        EndpointRuleSet.Builder builder = EndpointRuleSet.builder()
+                .parameters(Parameters.builder()
+                        .addParameter(Parameter.builder().name("R").type(ParameterType.STRING).required(true).build())
+                        .build());
+        for (Rule rule : rules) {
+            builder.addRule(rule);
+        }
+        return builder.build();
+    }
+
+    private static void assertAssignKept(Rule rule, String name) {
+        assertEquals(2, rule.getConditions().size());
+        assertTrue(rule.getConditions().get(0).getResult().isPresent());
+        assertEquals(name, rule.getConditions().get(0).getResult().get().toString());
     }
 }

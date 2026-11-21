@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Function;
@@ -22,14 +23,21 @@ import software.amazon.smithy.model.shapes.ShapeId;
 import software.amazon.smithy.model.traits.AbstractTrait;
 import software.amazon.smithy.model.traits.AbstractTraitBuilder;
 import software.amazon.smithy.model.traits.Trait;
+import software.amazon.smithy.rulesengine.language.Endpoint;
 import software.amazon.smithy.rulesengine.language.EndpointComponentFactory;
 import software.amazon.smithy.rulesengine.language.EndpointRuleSet;
 import software.amazon.smithy.rulesengine.language.EndpointRuleSetExtension;
 import software.amazon.smithy.rulesengine.language.RulesVersion;
 import software.amazon.smithy.rulesengine.language.evaluation.Scope;
 import software.amazon.smithy.rulesengine.language.evaluation.type.Type;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.Expression;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.Reference;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.functions.IsSet;
+import software.amazon.smithy.rulesengine.language.syntax.expressions.literal.Literal;
 import software.amazon.smithy.rulesengine.language.syntax.parameters.Parameters;
 import software.amazon.smithy.rulesengine.language.syntax.rule.Condition;
+import software.amazon.smithy.rulesengine.language.syntax.rule.EndpointRule;
+import software.amazon.smithy.rulesengine.language.syntax.rule.ErrorRule;
 import software.amazon.smithy.rulesengine.language.syntax.rule.NoMatchRule;
 import software.amazon.smithy.rulesengine.language.syntax.rule.Rule;
 import software.amazon.smithy.rulesengine.logic.bdd.Bdd;
@@ -115,6 +123,10 @@ public final class EndpointBddTrait extends AbstractTrait implements ToSmithyBui
      * <p>This should be called after all BDD optimizations (sifting, cost optimization) are complete.
      * A condition could become unreferenced if it is optimized away by the BDD compiler because hi==lo.
      *
+     * <p>A zero-refcount condition is kept when a result, or a later kept condition, still needs the
+     * name it assigns or the {@code isSet} proof it establishes. Results are type-checked in the scope
+     * built from the conditions that remain.
+     *
      * @return a new trait with unreferenced conditions removed, or this trait if none were removed
      */
     public EndpointBddTrait removeUnreferencedConditions() {
@@ -124,6 +136,24 @@ public final class EndpointBddTrait extends AbstractTrait implements ToSmithyBui
             int var = bdd.getVariable(i);
             if (var >= 0 && var < refCount.length) {
                 refCount[var]++;
+            }
+        }
+
+        // Keep an unreferenced condition that a result or a later kept condition needs in order to
+        // type-check. Conditions only rely on earlier conditions, so one backward pass finds them.
+        Set<String> needed = new HashSet<>();
+        for (Rule result : results) {
+            addResultReferences(result, needed);
+        }
+        for (int i = conditions.size() - 1; i >= 0; i--) {
+            Condition condition = conditions.get(i);
+            boolean assignsNeeded = condition.getResult().isPresent()
+                    && needed.contains(condition.getResult().get().toString());
+            if (refCount[i] == 0 && (assignsNeeded || provesSet(condition, needed))) {
+                refCount[i]++;
+            }
+            if (refCount[i] > 0) {
+                needed.addAll(condition.getFunction().getReferences());
             }
         }
 
@@ -163,6 +193,34 @@ public final class EndpointBddTrait extends AbstractTrait implements ToSmithyBui
                 .bdd(new Bdd(bdd
                         .getRootRef(), newConditions.size(), bdd.getResultCount(), bdd.getNodeCount(), newNodes))
                 .build();
+    }
+
+    private static boolean provesSet(Condition condition, Set<String> needed) {
+        if (condition.getFunction().getFunctionDefinition() != IsSet.getDefinition()) {
+            return false;
+        }
+        List<Expression> arguments = condition.getFunction().getArguments();
+        if (arguments.isEmpty() || !(arguments.get(0) instanceof Reference)) {
+            return false;
+        }
+        return needed.contains(((Reference) arguments.get(0)).getName().toString());
+    }
+
+    private static void addResultReferences(Rule result, Set<String> needed) {
+        if (result instanceof EndpointRule) {
+            Endpoint endpoint = ((EndpointRule) result).getEndpoint();
+            needed.addAll(endpoint.getUrl().getReferences());
+            for (List<Expression> values : endpoint.getHeaders().values()) {
+                for (Expression value : values) {
+                    needed.addAll(value.getReferences());
+                }
+            }
+            for (Literal value : endpoint.getProperties().values()) {
+                needed.addAll(value.getReferences());
+            }
+        } else if (result instanceof ErrorRule) {
+            needed.addAll(((ErrorRule) result).getError().getReferences());
+        }
     }
 
     /**
